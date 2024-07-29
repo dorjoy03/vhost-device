@@ -86,10 +86,14 @@ pub(crate) enum Error {
     HandleEventNotEpollIn,
     #[error("Failed to handle unknown event")]
     HandleUnknownEvent,
-    #[error("Failed to accept new local socket connection")]
+    #[error("Failed to accept new local unix domain socket connection")]
     UnixAccept(std::io::Error),
+    #[error("Failed to accept new local vsock socket connection")]
+    VsockAccept(std::io::Error),
     #[error("Failed to bind a unix stream")]
     UnixBind(std::io::Error),
+    #[error("Failed to bind a vsock stream")]
+    VsockBind(std::io::Error),
     #[error("Failed to create an epoll fd")]
     EpollFdCreate(std::io::Error),
     #[error("Failed to add to epoll")]
@@ -118,8 +122,10 @@ pub(crate) enum Error {
     PktBufMissing,
     #[error("Failed to connect to unix socket")]
     UnixConnect(std::io::Error),
-    #[error("Unable to write to unix stream")]
-    UnixWrite,
+    #[error("Failed to connect to vsock socket")]
+    VsockConnect(std::io::Error),
+    #[error("Unable to write to stream")]
+    StreamWrite,
     #[error("Unable to push data to local tx buffer")]
     LocalTxBufFull,
     #[error("Unable to flush data from local tx buffer")]
@@ -142,13 +148,27 @@ impl std::convert::From<Error> for std::io::Error {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct VsockProxyInfo {
+    pub forward_cid: u32,
+    pub listen_ports: Vec<u32>
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) enum ProxyType {
+    /// unix domain socket path
+    UnixDomainSocket(String),
+    /// the vsock CID and ports
+    Vsock(VsockProxyInfo),
+}
+
 #[derive(Debug, Clone)]
 /// This structure is the public API through which an external program
 /// is allowed to configure the backend.
 pub(crate) struct VsockConfig {
     guest_cid: u64,
     socket: String,
-    uds_path: String,
+    proxy_info: ProxyType,
     tx_buffer_size: u32,
     queue_size: usize,
     groups: Vec<String>,
@@ -160,7 +180,7 @@ impl VsockConfig {
     pub fn new(
         guest_cid: u64,
         socket: String,
-        uds_path: String,
+        proxy_info: ProxyType,
         tx_buffer_size: u32,
         queue_size: usize,
         groups: Vec<String>,
@@ -168,7 +188,7 @@ impl VsockConfig {
         Self {
             guest_cid,
             socket,
-            uds_path,
+            proxy_info,
             tx_buffer_size,
             queue_size,
             groups,
@@ -180,10 +200,8 @@ impl VsockConfig {
         self.guest_cid
     }
 
-    /// Return the path of the unix domain socket which is listening to
-    /// requests from the host side application.
-    pub fn get_uds_path(&self) -> String {
-        String::from(&self.uds_path)
+    pub fn get_proxy_info(&self) -> ProxyType {
+        self.proxy_info.clone()
     }
 
     /// Return the path of the unix domain socket which is listening to
@@ -244,7 +262,7 @@ pub(crate) struct VhostUserVsockBackend {
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig, cid_map: Arc<RwLock<CidMap>>) -> Result<Self> {
         let thread = Mutex::new(VhostUserVsockThread::new(
-            config.get_uds_path(),
+            config.get_proxy_info(),
             config.get_guest_cid(),
             config.get_tx_buffer_size(),
             config.get_groups(),
@@ -386,34 +404,7 @@ mod tests {
     const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
     const QUEUE_SIZE: usize = 1024;
 
-    #[test]
-    fn test_vsock_backend() {
-        const CID: u64 = 3;
-
-        let groups_list: Vec<String> = vec![String::from("default")];
-
-        let test_dir = tempdir().expect("Could not create a temp test directory.");
-
-        let vhost_socket_path = test_dir
-            .path()
-            .join("test_vsock_backend.socket")
-            .display()
-            .to_string();
-        let vsock_socket_path = test_dir
-            .path()
-            .join("test_vsock_backend.vsock")
-            .display()
-            .to_string();
-
-        let config = VsockConfig::new(
-            CID,
-            vhost_socket_path.to_string(),
-            vsock_socket_path.to_string(),
-            CONN_TX_BUF_SIZE,
-            QUEUE_SIZE,
-            groups_list,
-        );
-
+    fn test_vsock_backend(config: VsockConfig, expected_cid: u64) {
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let backend = VhostUserVsockBackend::new(config, cid_map);
@@ -448,7 +439,7 @@ mod tests {
         let config = backend.get_config(0, 8);
         assert_eq!(config.len(), 8);
         let cid = u64::from_le_bytes(config.try_into().unwrap());
-        assert_eq!(cid, CID);
+        assert_eq!(cid, expected_cid);
 
         let exit = backend.exit_event(0);
         assert!(exit.is_some());
@@ -465,11 +456,70 @@ mod tests {
 
         let ret = backend.handle_event(BACKEND_EVENT, EventSet::IN, &vrings, 0);
         assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_vsock_backend_unix() {
+        const CID: u64 = 3;
+
+        let groups_list: Vec<String> = vec![String::from("default")];
+
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+
+        let vhost_socket_path = test_dir
+            .path()
+            .join("test_vsock_backend_unix.socket")
+            .display()
+            .to_string();
+        let vsock_socket_path = test_dir
+            .path()
+            .join("test_vsock_backend.vsock")
+            .display()
+            .to_string();
+
+         let config = VsockConfig::new(
+             CID,
+             vhost_socket_path.to_string(),
+             ProxyType::UnixDomainSocket(vsock_socket_path.to_string()),
+             CONN_TX_BUF_SIZE,
+             QUEUE_SIZE,
+             groups_list,
+         );
+
+        test_vsock_backend(config, CID);
 
         // cleanup
         let _ = std::fs::remove_file(vhost_socket_path);
         let _ = std::fs::remove_file(vsock_socket_path);
+        test_dir.close().unwrap();
+    }
 
+    #[test]
+    fn test_vsock_backend_vsock() {
+        const CID: u64 = 3;
+
+        let groups_list: Vec<String> = vec![String::from("default")];
+
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+
+        let vhost_socket_path = test_dir
+            .path()
+            .join("test_vsock_backend.socket")
+            .display()
+            .to_string();
+         let config = VsockConfig::new(
+             CID,
+             vhost_socket_path.to_string(),
+             ProxyType::Vsock(VsockProxyInfo {forward_cid: 1, listen_ports: vec![9001, 9002]}),
+             CONN_TX_BUF_SIZE,
+             QUEUE_SIZE,
+             groups_list,
+         );
+
+        test_vsock_backend(config, CID);
+
+        // cleanup
+        let _ = std::fs::remove_file(vhost_socket_path);
         test_dir.close().unwrap();
     }
 
@@ -495,7 +545,7 @@ mod tests {
         let config = VsockConfig::new(
             CID,
             "/sys/not_allowed.socket".to_string(),
-            "/sys/not_allowed.vsock".to_string(),
+            ProxyType::UnixDomainSocket("/sys/not_allowed.vsock".to_string()),
             CONN_TX_BUF_SIZE,
             QUEUE_SIZE,
             groups.clone(),
@@ -509,7 +559,7 @@ mod tests {
         let config = VsockConfig::new(
             CID,
             vhost_socket_path.to_string(),
-            vsock_socket_path.to_string(),
+            ProxyType::UnixDomainSocket(vsock_socket_path.to_string()),
             CONN_TX_BUF_SIZE,
             QUEUE_SIZE,
             groups,
@@ -554,9 +604,11 @@ mod tests {
 
     #[test]
     fn test_vhu_vsock_structs() {
-        let config = VsockConfig::new(0, String::new(), String::new(), 0, 0, vec![String::new()]);
+        let unix_config = VsockConfig::new(0, String::new(), ProxyType::UnixDomainSocket(String::new()), 0, 0, vec![String::new()]);
+        assert_eq!(format!("{unix_config:?}"), "VsockConfig { guest_cid: 0, socket: \"\", proxy_info: UnixDomainSocket(\"\"), tx_buffer_size: 0, queue_size: 0, groups: [\"\"] }");
 
-        assert_eq!(format!("{config:?}"), "VsockConfig { guest_cid: 0, socket: \"\", uds_path: \"\", tx_buffer_size: 0, queue_size: 0, groups: [\"\"] }");
+        let vsock_config = VsockConfig::new(0, String::new(), ProxyType::Vsock(VsockProxyInfo {forward_cid: 1, listen_ports: vec![9001, 9002]}), 0, 0, vec![String::new()]);
+        assert_eq!(format!("{vsock_config:?}"), "VsockConfig { guest_cid: 0, socket: \"\", proxy_info: Vsock(VsockProxyInfo { forward_cid: 1, listen_ports: [9001, 9002] }), tx_buffer_size: 0, queue_size: 0, groups: [\"\"] }");
 
         let conn_map = ConnMapKey::new(0, 0);
         assert_eq!(
