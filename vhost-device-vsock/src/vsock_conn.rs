@@ -53,6 +53,8 @@ pub(crate) struct VsockConnection<S> {
     pub tx_buf: LocalTxBuf,
     /// Local tx buffer size
     tx_buffer_size: u32,
+    /// Should write "OK {port}" when connection is established
+    write_ok: bool,
 }
 
 impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
@@ -66,6 +68,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
         guest_port: u32,
         epoll_fd: RawFd,
         tx_buffer_size: u32,
+        write_ok: bool,
     ) -> Self {
         Self {
             stream,
@@ -83,6 +86,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
             epoll_fd,
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
+            write_ok,
         }
     }
 
@@ -117,6 +121,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
             epoll_fd,
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
+            write_ok: true,
         }
     }
 
@@ -231,8 +236,10 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
             VSOCK_OP_RESPONSE => {
                 // Confirmation for a host initiated connection
                 // TODO: Handle stream write error in a better manner
-                let response = format!("OK {}\n", self.peer_port);
-                self.stream.write_all(response.as_bytes()).unwrap();
+                if self.write_ok {
+                    let response = format!("OK {}\n", self.peer_port);
+                    self.stream.write_all(response.as_bytes()).unwrap();
+                }
                 self.connect = true;
             }
             VSOCK_OP_RW => {
@@ -298,7 +305,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
     ///
     /// Returns:
     /// - Ok(cnt) where cnt is the number of bytes written to the stream
-    /// - Err(Error::UnixWrite) if there was an error writing to the stream
+    /// - Err(Error::StreamWrite) if there was an error writing to the stream
     fn send_bytes<B: BitmapSlice>(&mut self, buf: &VolatileSlice<B>) -> Result<()> {
         if !self.tx_buf.is_empty() {
             // Data is already present in the buffer and the backend
@@ -315,12 +322,12 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile> VsockConnection<S> {
                     0
                 } else {
                     dbg!("send_bytes error: {:?}", e);
-                    return Err(Error::UnixWrite);
+                    return Err(Error::StreamWrite);
                 }
             }
             Err(e) => {
                 dbg!("send_bytes error: {:?}", e);
-                return Err(Error::UnixWrite);
+                return Err(Error::StreamWrite);
             }
         };
 
@@ -595,6 +602,7 @@ mod tests {
             5001,
             -1,
             CONN_TX_BUF_SIZE,
+            true,
         );
 
         assert!(!conn_local.connect);
@@ -643,6 +651,7 @@ mod tests {
             5001,
             -1,
             CONN_TX_BUF_SIZE,
+            true,
         );
 
         assert_eq!(conn_local.peer_avail_credit(), 0);
@@ -675,6 +684,7 @@ mod tests {
             5001,
             -1,
             CONN_TX_BUF_SIZE,
+            true,
         );
 
         // write only descriptor chain
@@ -710,6 +720,7 @@ mod tests {
             5001,
             -1,
             CONN_TX_BUF_SIZE,
+            true,
         );
 
         // write only descriptor chain
@@ -808,6 +819,7 @@ mod tests {
             5001,
             -1,
             CONN_TX_BUF_SIZE,
+            true,
         );
 
         // write only descriptor chain
